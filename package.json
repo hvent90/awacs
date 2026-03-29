@@ -1,0 +1,12 @@
+{
+  "name": "awacs",
+  "version": "0.1.0",
+  "description": "Local dashboard that discovers and displays every server running on your machine",
+  "scripts": {
+    "start": "bun run src/server.ts",
+    "screenshot": "bun run screenshot.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.11"
+  }
+}
