@@ -70,6 +70,7 @@ function formatRss(kb) {
 function shortenArgs(args) {
   return args
     .replace(/\/Users\/[^/]+/g, "~")
+    .replace(/[A-Z]:\\Users\\[^\\]+/gi, "~")
     .replace(/\/opt\/homebrew\/Cellar\/[^/]+\/[^/]+\/bin\//g, "");
 }
 
@@ -80,6 +81,8 @@ function buildTree(services, indexMap) {
     var s = services[i];
     var realIndex = indexMap ? indexMap[i] : i;
     var path = s.cwd || "unknown";
+    path = path.replace(/\\/g, "/");
+    path = path.replace(/^[A-Z]:\/Users\/[^/]+/i, "~");
     path = path.replace(/^\/Users\/[^/]+/, "~");
     path = path.replace(/^\/private/, "");
 
@@ -89,7 +92,7 @@ function buildTree(services, indexMap) {
       var part = parts[j];
       if (!node[part]) node[part] = { _children: {}, _projects: {} };
       if (j === parts.length - 1) {
-        var proj = s.projectName || s.cwd.split("/").pop() || "unknown";
+        var proj = s.projectName || s.cwd.replace(/\\/g, "/").split("/").pop() || "unknown";
         if (!node[part]._projects[proj]) node[part]._projects[proj] = [];
         node[part]._projects[proj].push(realIndex);
       }
