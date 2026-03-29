@@ -1,14 +1,78 @@
 import { scan, killService, restartService } from "./scanner";
+import type { Service } from "./scanner";
+import dgram from "dgram";
+import os from "os";
+import { parseArgs } from "util";
 
 const PORT = 7777;
+const DISCOVERY_PORT = 7778;
+const HEARTBEAT_INTERVAL = 5000;
+const PEER_TIMEOUT = 15000;
+const PEER_POLL_INTERVAL = 10000;
+
+// --- CLI ---
+const { values: cliArgs } = parseArgs({
+  args: Bun.argv.slice(2),
+  options: { peers: { type: "string" } },
+  strict: false,
+});
+
+// --- Peer types & state ---
+interface Peer {
+  host: string;
+  port: number;
+  hostname: string;
+  services: Service[];
+  lastSeen: number;
+  manual: boolean;
+}
+
+const peers = new Map<string, Peer>();
+
+// Initialize manual peers
+if (cliArgs.peers) {
+  for (const entry of (cliArgs.peers as string).split(",")) {
+    const trimmed = entry.trim();
+    if (!trimmed) continue;
+    const lastColon = trimmed.lastIndexOf(":");
+    const hasPort = lastColon > 0 && !isNaN(parseInt(trimmed.substring(lastColon + 1)));
+    const host = hasPort ? trimmed.substring(0, lastColon) : trimmed;
+    const port = hasPort ? parseInt(trimmed.substring(lastColon + 1)) : PORT;
+    const key = `${host}:${port}`;
+    peers.set(key, { host, port, hostname: host, services: [], lastSeen: 0, manual: true });
+  }
+}
+
+// --- Local identity ---
+function getLocalAddresses(): Set<string> {
+  const addrs = new Set<string>(["127.0.0.1", "::1", "localhost"]);
+  const nets = os.networkInterfaces();
+  for (const name in nets) {
+    for (const net of nets[name]!) {
+      addrs.add(net.address);
+    }
+  }
+  return addrs;
+}
+
+const localAddresses = getLocalAddresses();
+const localHostname = os.hostname();
 
 // --- SSE + PID watcher ---
 let cachedServices: Awaited<ReturnType<typeof scan>> = [];
 let trackedPids = new Set<number>();
 const sseClients = new Set<ReadableStreamDefaultController>();
 
-function broadcast(services: typeof cachedServices) {
-  const data = JSON.stringify(services);
+function getAllServices(): Service[] {
+  const all: Service[] = [...cachedServices];
+  for (const [, peer] of peers) {
+    all.push(...peer.services);
+  }
+  return all;
+}
+
+function broadcastAll() {
+  const data = JSON.stringify(getAllServices());
   for (const controller of sseClients) {
     try {
       controller.enqueue(`data: ${data}\n\n`);
@@ -24,7 +88,7 @@ async function fullRescan() {
     trackedPids = new Set(
       cachedServices.filter((s) => s.pid > 0).map((s) => s.pid)
     );
-    broadcast(cachedServices);
+    broadcastAll();
   } catch (e) {
     console.error("Scan error:", e);
   }
@@ -33,14 +97,14 @@ async function fullRescan() {
 
 function pidAlive(pid: number): boolean {
   try {
-    process.kill(pid, 0); // doesn't kill — just checks existence
+    process.kill(pid, 0);
     return true;
   } catch {
     return false;
   }
 }
 
-// Fast liveness check every 1s — if any tracked PID died, trigger full rescan
+// Fast liveness check every 1s
 setInterval(async () => {
   try {
     if (trackedPids.size === 0) return;
@@ -55,13 +119,95 @@ setInterval(async () => {
   }
 }, 1000);
 
-// Periodic full rescan every 10s to pick up NEW processes
+// Periodic full rescan every 10s
 setInterval(async () => {
   try { await fullRescan(); } catch (e) { console.error("Rescan error:", e); }
 }, 10000);
 
 // Initial scan
 fullRescan();
+
+// --- UDP Discovery ---
+const udpSocket = dgram.createSocket({ type: "udp4", reuseAddr: true });
+
+udpSocket.on("message", (msg, rinfo) => {
+  try {
+    const data = JSON.parse(msg.toString());
+    const senderHost = rinfo.address;
+    const senderPort = data.port ?? PORT;
+
+    // Ignore own broadcasts
+    if (localAddresses.has(senderHost) && senderPort === PORT) return;
+
+    const key = `${senderHost}:${senderPort}`;
+    const existing = peers.get(key);
+    if (existing) {
+      existing.lastSeen = Date.now();
+      existing.hostname = data.hostname || senderHost;
+    } else {
+      peers.set(key, {
+        host: senderHost,
+        port: senderPort,
+        hostname: data.hostname || senderHost,
+        services: [],
+        lastSeen: Date.now(),
+        manual: false,
+      });
+    }
+  } catch {}
+});
+
+udpSocket.bind(DISCOVERY_PORT, () => {
+  udpSocket.setBroadcast(true);
+  console.log(`AWACS discovery on UDP :${DISCOVERY_PORT}`);
+});
+
+// Heartbeat every 5s
+setInterval(() => {
+  const buf = Buffer.from(JSON.stringify({ port: PORT, hostname: localHostname }));
+  try {
+    udpSocket.send(buf, 0, buf.length, DISCOVERY_PORT, "255.255.255.255");
+  } catch (e) {
+    console.error("Heartbeat error:", e);
+  }
+}, HEARTBEAT_INTERVAL);
+
+// Prune stale discovered peers every 5s
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, peer] of peers) {
+    if (!peer.manual && now - peer.lastSeen > PEER_TIMEOUT) {
+      peers.delete(key);
+      broadcastAll();
+    }
+  }
+}, HEARTBEAT_INTERVAL);
+
+// --- Peer polling ---
+async function pollPeerServices() {
+  for (const [, peer] of peers) {
+    try {
+      const resp = await fetch(`http://${peer.host}:${peer.port}/api/services?local=1`, {
+        signal: AbortSignal.timeout(5000),
+      });
+      if (resp.ok) {
+        const remoteSvcs: Service[] = await resp.json();
+        peer.services = remoteSvcs.map((s) => ({
+          ...s,
+          peerHost: peer.host,
+          peerHostname: peer.hostname,
+        }));
+        if (peer.manual) peer.lastSeen = Date.now();
+      }
+    } catch {
+      if (peer.manual) peer.services = [];
+    }
+  }
+  broadcastAll();
+}
+
+setInterval(pollPeerServices, PEER_POLL_INTERVAL);
+setTimeout(pollPeerServices, 3000);
 
 const HTML = `<!DOCTYPE html>
 <html>
@@ -115,6 +261,14 @@ const HTML = `<!DOCTYPE html>
   .project-actions { display: inline-flex; gap: 4px; margin-left: auto; visibility: hidden; }
   .project:hover > .project-name > .project-actions { visibility: visible; }
 
+  .host-group { margin-bottom: 24px; }
+  .host-header { font-size: 12px; font-weight: 600; padding: 8px; border-bottom: 1px solid #222; margin-bottom: 4px; display: flex; align-items: center; gap: 8px; }
+  .host-header .host-ip { color: #555; font-weight: 400; }
+  .host-header.local { color: #4fc3f7; }
+  .host-header.remote { color: #ffb74d; }
+  .peer-badge { font-size: 9px; padding: 1px 6px; border-radius: 3px; background: #1b2e1b; color: #81c784; text-transform: uppercase; letter-spacing: 1px; }
+  .peer-badge.local { background: #1b2e3e; color: #4fc3f7; }
+
   .refresh-info { font-size: 11px; color: #333; margin-top: 16px; }
 </style>
 </head>
@@ -137,13 +291,16 @@ const HTML = `<!DOCTYPE html>
   }
 
   function portLink(s) {
-    // Use the current browser hostname so links work from LAN too
-    var host = location.hostname;
+    var host = s.peerHost || location.hostname;
     var bind = s.bindAddress;
-    // If bound to localhost/127.0.0.1/::1, only link if viewing from localhost
     var isLocal = bind === "127.0.0.1" || bind === "[::1]" || bind === "localhost";
-    if (isLocal && host !== "localhost" && host !== "127.0.0.1") {
-      return ":" + s.port + ' <span style="color:#444">(local only)</span>';
+    if (isLocal) {
+      if (s.peerHost) {
+        return ":" + s.port + ' <span style="color:#444">(remote localhost)</span>';
+      }
+      if (host !== "localhost" && host !== "127.0.0.1") {
+        return ":" + s.port + ' <span style="color:#444">(local only)</span>';
+      }
     }
     var url = "http://" + host + ":" + s.port;
     return '<a href="' + url + '" target="_blank" style="color:#4fc3f7;text-decoration:none">:' + s.port + '</a>';
@@ -152,28 +309,36 @@ const HTML = `<!DOCTYPE html>
   function killByIndex(idx) {
     var s = allServices[idx];
     if (!s) return;
-    if (!confirm("Kill " + (s.source === "docker" ? s.dockerName : "PID " + s.pid) + "?")) return;
-    apiAction("/api/kill", [{ pid: s.pid, source: s.source, dockerName: s.dockerName }]);
+    var label = s.source === "docker" ? s.dockerName : "PID " + s.pid;
+    var where = s.peerHostname ? ' on "' + s.peerHostname + '" (' + s.peerHost + ')' : "";
+    if (!confirm("Kill " + label + where + "?")) return;
+    apiAction("/api/kill", [{ pid: s.pid, source: s.source, dockerName: s.dockerName, peerHost: s.peerHost }]);
   }
 
   function restartByIndex(idx) {
     var s = allServices[idx];
     if (!s) return;
-    apiAction("/api/restart", [{ pid: s.pid, source: s.source, dockerName: s.dockerName, args: s.args, cwd: s.cwd }]);
+    var label = s.source === "docker" ? s.dockerName : "PID " + s.pid;
+    var where = s.peerHostname ? ' on "' + s.peerHostname + '" (' + s.peerHost + ')' : "";
+    if (!confirm("Restart " + label + where + "?")) return;
+    apiAction("/api/restart", [{ pid: s.pid, source: s.source, dockerName: s.dockerName, args: s.args, cwd: s.cwd, peerHost: s.peerHost }]);
   }
 
   function killProject(indices) {
     var svcs = indices.map(function(i) { return allServices[i]; }).filter(Boolean);
     if (!svcs.length) return;
     var names = svcs.map(function(s) { return s.source === "docker" ? s.dockerName : "PID " + s.pid; }).join(", ");
-    if (!confirm("Kill all: " + names + "?")) return;
-    apiAction("/api/kill", svcs.map(function(s) { return { pid: s.pid, source: s.source, dockerName: s.dockerName }; }));
+    var where = svcs[0].peerHostname ? ' on "' + svcs[0].peerHostname + '" (' + svcs[0].peerHost + ')' : "";
+    if (!confirm("Kill all" + where + ": " + names + "?")) return;
+    apiAction("/api/kill", svcs.map(function(s) { return { pid: s.pid, source: s.source, dockerName: s.dockerName, peerHost: s.peerHost }; }));
   }
 
   function restartProject(indices) {
     var svcs = indices.map(function(i) { return allServices[i]; }).filter(Boolean);
     if (!svcs.length) return;
-    apiAction("/api/restart", svcs.map(function(s) { return { pid: s.pid, source: s.source, dockerName: s.dockerName, args: s.args, cwd: s.cwd }; }));
+    var where = svcs[0].peerHostname ? ' on "' + svcs[0].peerHostname + '" (' + svcs[0].peerHost + ')' : "";
+    if (!confirm("Restart all" + where + "?")) return;
+    apiAction("/api/restart", svcs.map(function(s) { return { pid: s.pid, source: s.source, dockerName: s.dockerName, args: s.args, cwd: s.cwd, peerHost: s.peerHost }; }));
   }
 
   function escapeHtml(s) {
@@ -194,18 +359,14 @@ const HTML = `<!DOCTYPE html>
       .replace(/\\/opt\\/homebrew\\/Cellar\\/[^/]+\\/[^/]+\\/bin\\//g, "");
   }
 
-  function buildTree(services) {
-    // Group services by path
-    // For processes: use cwd, replace home dir with ~
-    // For docker: use "Docker" as root
+  function buildTree(services, indexMap) {
     var tree = {};
 
     for (var i = 0; i < services.length; i++) {
       var s = services[i];
-      var path;
-      path = s.cwd || "unknown";
+      var realIndex = indexMap ? indexMap[i] : i;
+      var path = s.cwd || "unknown";
       path = path.replace(/^\\/Users\\/[^/]+/, "~");
-      // Strip /private prefix (macOS tmp dirs)
       path = path.replace(/^\\/private/, "");
 
       var parts = path.split("/").filter(function(p) { return p; });
@@ -214,10 +375,9 @@ const HTML = `<!DOCTYPE html>
         var part = parts[j];
         if (!node[part]) node[part] = { _children: {}, _projects: {} };
         if (j === parts.length - 1) {
-          // Group by project name under this folder, storing indices into allServices
           var proj = s.projectName || s.cwd.split("/").pop() || "unknown";
           if (!node[part]._projects[proj]) node[part]._projects[proj] = [];
-          node[part]._projects[proj].push(i);
+          node[part]._projects[proj].push(realIndex);
         }
         node = node[part]._children;
       }
@@ -370,38 +530,69 @@ const HTML = `<!DOCTYPE html>
 
     var processCount = 0;
     var dockerCount = 0;
+    var peerHosts = {};
     for (var i = 0; i < services.length; i++) {
       if (services[i].source === "docker") dockerCount++;
       else processCount++;
+      if (services[i].peerHost) peerHosts[services[i].peerHost] = true;
     }
+    var peerCount = Object.keys(peerHosts).length;
 
     stats.innerHTML =
       "Services: <span>" + services.length + "</span>" +
       "&nbsp;&nbsp;Processes: <span>" + processCount + "</span>" +
-      "&nbsp;&nbsp;Containers: <span>" + dockerCount + "</span>";
+      "&nbsp;&nbsp;Containers: <span>" + dockerCount + "</span>" +
+      (peerCount > 0 ? "&nbsp;&nbsp;Peers: <span>" + peerCount + "</span>" : "");
 
-    var rawTree = buildTree(services);
-    var compacted = compactPath(
-      // Wrap rawTree keys into node format for compactPath
-      (function() {
-        var wrapped = {};
-        var keys = Object.keys(rawTree);
-        for (var i = 0; i < keys.length; i++) {
-          wrapped[keys[i]] = rawTree[keys[i]];
-        }
-        return wrapped;
-      })()
-    );
+    // Group services by host
+    var groups = {};
+    var hostnames = {};
+    for (var i = 0; i < services.length; i++) {
+      var s = services[i];
+      var gKey = s.peerHost || "__local__";
+      if (!groups[gKey]) groups[gKey] = [];
+      groups[gKey].push(i);
+      if (s.peerHost && s.peerHostname) hostnames[s.peerHost] = s.peerHostname;
+    }
 
     var html = "";
-    var topKeys = Object.keys(compacted).sort();
-    for (var i = 0; i < topKeys.length; i++) {
-      html += renderFolder(topKeys[i], compacted[topKeys[i]], "");
+    var groupKeys = Object.keys(groups).sort(function(a, b) {
+      if (a === "__local__") return -1;
+      if (b === "__local__") return 1;
+      return (hostnames[a] || a).localeCompare(hostnames[b] || b);
+    });
+
+    for (var g = 0; g < groupKeys.length; g++) {
+      var gKey = groupKeys[g];
+      var isLocal = gKey === "__local__";
+      var indices = groups[gKey];
+      var groupServices = indices.map(function(i) { return allServices[i]; });
+
+      html += '<div class="host-group">';
+      if (groupKeys.length > 1 || !isLocal) {
+        html += '<div class="host-header ' + (isLocal ? 'local' : 'remote') + '">';
+        html += '<span class="peer-badge ' + (isLocal ? 'local' : '') + '">' + (isLocal ? 'local' : 'remote') + '</span>';
+        if (isLocal) {
+          html += 'This machine';
+        } else {
+          html += escapeHtml(hostnames[gKey] || gKey) + ' <span class="host-ip">&middot; ' + escapeHtml(gKey) + '</span>';
+        }
+        html += ' <span class="count">(' + indices.length + ')</span>';
+        html += '</div>';
+      }
+
+      var rawTree = buildTree(groupServices, indices);
+      var compacted = compactPath(rawTree);
+
+      var topKeys = Object.keys(compacted).sort();
+      for (var i = 0; i < topKeys.length; i++) {
+        html += renderFolder(topKeys[i], compacted[topKeys[i]], gKey);
+      }
+      html += '</div>';
     }
 
     treeEl.innerHTML = html;
 
-    // Attach click handlers to folder and project names
     var clickables = treeEl.querySelectorAll(".folder-name, .project-name");
     for (var i = 0; i < clickables.length; i++) {
       clickables[i].addEventListener("click", function(e) {
@@ -438,15 +629,15 @@ const server = Bun.serve({
     const url = new URL(req.url);
 
     if (url.pathname === "/api/services") {
-      return Response.json(cachedServices);
+      const localOnly = url.searchParams.has("local");
+      return Response.json(localOnly ? cachedServices : getAllServices());
     }
 
     if (url.pathname === "/api/events") {
       const stream = new ReadableStream({
         start(controller) {
           sseClients.add(controller);
-          // Send current state immediately
-          controller.enqueue(`data: ${JSON.stringify(cachedServices)}\n\n`);
+          controller.enqueue(`data: ${JSON.stringify(getAllServices())}\n\n`);
         },
         cancel(controller) {
           sseClients.delete(controller);
@@ -461,31 +652,54 @@ const server = Bun.serve({
       });
     }
 
-    if (url.pathname === "/api/kill" && req.method === "POST") {
+    if ((url.pathname === "/api/kill" || url.pathname === "/api/restart") && req.method === "POST") {
+      const isKill = url.pathname === "/api/kill";
       try {
         const body = await req.json();
         const targets = body.services || [body];
         const results: string[] = [];
-        for (const svc of targets) {
-          results.push(await killService(svc));
-        }
-        // PID watcher will detect the death and rescan, but also force one now
-        setTimeout(() => fullRescan(), 500);
-        return Response.json({ ok: true, results });
-      } catch (e: any) {
-        return Response.json({ ok: false, error: e.message }, { status: 500 });
-      }
-    }
 
-    if (url.pathname === "/api/restart" && req.method === "POST") {
-      try {
-        const body = await req.json();
-        const targets = body.services || [body];
-        const results: string[] = [];
+        // Separate local vs remote targets
+        const localTargets: any[] = [];
+        const remoteGroups = new Map<string, any[]>();
+
         for (const svc of targets) {
-          results.push(await restartService(svc));
+          if (svc.peerHost) {
+            const peer = [...peers.values()].find((p) => p.host === svc.peerHost);
+            const peerPort = peer?.port ?? PORT;
+            const key = `${svc.peerHost}:${peerPort}`;
+            if (!remoteGroups.has(key)) remoteGroups.set(key, []);
+            remoteGroups.get(key)!.push(svc);
+          } else {
+            localTargets.push(svc);
+          }
         }
-        setTimeout(() => fullRescan(), 1500); // give process time to respawn
+
+        // Execute local actions
+        for (const svc of localTargets) {
+          results.push(await (isKill ? killService(svc) : restartService(svc)));
+        }
+
+        // Proxy remote actions
+        for (const [key, svcs] of remoteGroups) {
+          const lastColon = key.lastIndexOf(":");
+          const host = key.substring(0, lastColon);
+          const port = key.substring(lastColon + 1);
+          try {
+            const resp = await fetch(`http://${host}:${port}${url.pathname}`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ services: svcs.map(({ peerHost, peerHostname, ...rest }: any) => rest) }),
+              signal: AbortSignal.timeout(5000),
+            });
+            const data: any = await resp.json();
+            results.push(...(data.results || [`Forwarded to ${host}`]));
+          } catch (e: any) {
+            results.push(`Failed to reach ${host}: ${e.message}`);
+          }
+        }
+
+        setTimeout(() => fullRescan(), isKill ? 500 : 1500);
         return Response.json({ ok: true, results });
       } catch (e: any) {
         return Response.json({ ok: false, error: e.message }, { status: 500 });
@@ -499,3 +713,6 @@ const server = Bun.serve({
 });
 
 console.log(`AWACS running → http://localhost:${PORT}`);
+if (peers.size > 0) {
+  console.log(`Manual peers: ${[...peers.values()].map((p) => `${p.host}:${p.port}`).join(", ")}`);
+}

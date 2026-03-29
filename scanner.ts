@@ -1,6 +1,6 @@
 import { $ } from "bun";
 
-interface Service {
+export interface Service {
   pid: number;
   command: string;
   args: string;
@@ -15,6 +15,8 @@ interface Service {
   dockerName?: string;
   dockerImage?: string;
   dockerStatus?: string;
+  peerHost?: string;
+  peerHostname?: string;
 }
 
 // macOS system processes that listen on ports but aren't user servers
