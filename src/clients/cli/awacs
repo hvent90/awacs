@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# awacs — lightweight CLI client for AWACS
+set -euo pipefail
+
+AWACS_URL="${AWACS_URL:-http://localhost:7777}"
+
+usage() {
+  cat <<EOF
+Usage: awacs <command> [options]
+
+Commands:
+  ls, list          List running services (default)
+  watch             Live-stream service updates
+  kill <pid|name>   Kill a service by PID or docker name
+  restart <pid>     Restart a service by PID
+
+Options:
+  --local           Only show local services
+  --json            Output raw JSON
+  --host <url>      Override AWACS server (default: \$AWACS_URL or $AWACS_URL)
+
+EOF
+  exit 0
+}
+
+# --- Parse global flags ---
+LOCAL=""
+JSON=""
+CMD=""
+ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --local)  LOCAL="?local=1"; shift ;;
+    --json)   JSON=1; shift ;;
+    --host)   AWACS_URL="$2"; shift 2 ;;
+    -h|--help|help) usage ;;
+    -*) echo "Unknown flag: $1" >&2; exit 1 ;;
+    *)
+      if [[ -z "$CMD" ]]; then
+        CMD="$1"
+      else
+        ARGS+=("$1")
+      fi
+      shift ;;
+  esac
+done
+
+CMD="${CMD:-ls}"
+
+# --- Helpers ---
+fmt_rss() {
+  local kb=$1
+  if (( kb > 1048576 )); then
+    awk "BEGIN { printf \"%.1f GB\", $kb/1048576 }"
+  elif (( kb > 1024 )); then
+    awk "BEGIN { printf \"%d MB\", $kb/1024 }"
+  else
+    echo "${kb} KB"
+  fi
+}
+
+check_jq() {
+  if ! command -v jq &>/dev/null; then
+    echo "Error: jq is required (brew install jq)" >&2
+    exit 1
+  fi
+}
+
+# --- Commands ---
+cmd_list() {
+  check_jq
+  local resp
+  resp=$(curl -sf "${AWACS_URL}/api/services${LOCAL}") || { echo "Error: cannot reach ${AWACS_URL}" >&2; exit 1; }
+
+  if [[ -n "$JSON" ]]; then
+    echo "$resp" | jq .
+    return
+  fi
+
+  local count
+  count=$(echo "$resp" | jq length)
+  if (( count == 0 )); then
+    echo "No services found."
+    return
+  fi
+
+  # Header
+  printf "\033[1m%-7s %-6s %-14s %-40s %-8s %-10s %s\033[0m\n" \
+    "PORT" "PID" "COMMAND" "ARGS" "CPU%" "MEM" "PROJECT"
+
+  echo "$resp" | jq -r '.[] |
+    [
+      (if .port > 0 then (.port|tostring) else "—" end),
+      (if .pid > 0 then (.pid|tostring) else "—" end),
+      (if .source == "docker" then "docker" else .command end),
+      (if .source == "docker" then (.dockerImage // .dockerName // "") else .args end),
+      (if .source == "docker" then (.dockerStatus // "") else ((.cpu * 10 | round / 10 | tostring) + "%") end),
+      (.rss // 0 | tostring),
+      (.projectName // "—"),
+      (.peerHostname // "")
+    ] | @tsv' |
+  while IFS=$'\t' read -r port pid cmd args cpu_or_status rss project peer; do
+    mem=$(fmt_rss "${rss%%.*}")
+    if [[ "$cpu_or_status" != *"%"* ]]; then
+      mem="$cpu_or_status"
+      cpu_or_status="—"
+    fi
+    args="${args//\/Users\/*/\~}"
+    args="${args:0:38}"
+    label=""
+    if [[ -n "$peer" ]]; then
+      label=" \033[90m[$peer]\033[0m"
+    fi
+    printf "%-7s %-6s %-14s %-40s %-8s %-10s %s%b\n" \
+      "$port" "$pid" "$cmd" "$args" "$cpu_or_status" "$mem" "$project" "$label"
+  done
+}
+
+cmd_watch() {
+  # Launch interactive TUI (requires bun)
+  local tui_script="$(cd "$(dirname "$0")" && pwd)/tui.ts"
+  local tui_args=()
+  if [[ "$AWACS_URL" != "http://localhost:7777" ]]; then
+    tui_args+=(--host "$AWACS_URL")
+  fi
+  if [[ -n "$LOCAL" ]]; then
+    tui_args+=(--local)
+  fi
+  exec bun "$tui_script" ${tui_args[@]+"${tui_args[@]}"}
+}
+
+cmd_kill() {
+  check_jq
+  local target="${ARGS[0]:-}"
+  [[ -z "$target" ]] && { echo "Usage: awacs kill <pid|docker-name>" >&2; exit 1; }
+
+  local body
+  if [[ "$target" =~ ^[0-9]+$ ]]; then
+    body=$(jq -n --argjson pid "$target" '{"services":[{"pid":$pid,"source":"process"}]}')
+  else
+    body=$(jq -n --arg name "$target" '{"services":[{"pid":0,"source":"docker","dockerName":$name}]}')
+  fi
+
+  local resp
+  resp=$(curl -sf -X POST -H "Content-Type: application/json" -d "$body" "${AWACS_URL}/api/kill") || {
+    echo "Error: request failed" >&2; exit 1
+  }
+
+  if echo "$resp" | jq -e '.ok' &>/dev/null; then
+    echo "Killed: $target"
+    echo "$resp" | jq -r '.results[]?' 2>/dev/null
+  else
+    echo "Failed:" >&2
+    echo "$resp" | jq . >&2
+    exit 1
+  fi
+}
+
+cmd_restart() {
+  check_jq
+  local target="${ARGS[0]:-}"
+  [[ -z "$target" ]] && { echo "Usage: awacs restart <pid>" >&2; exit 1; }
+
+  local body
+  body=$(jq -n --argjson pid "$target" '{"services":[{"pid":$pid,"source":"process"}]}')
+
+  local resp
+  resp=$(curl -sf -X POST -H "Content-Type: application/json" -d "$body" "${AWACS_URL}/api/restart") || {
+    echo "Error: request failed" >&2; exit 1
+  }
+
+  if echo "$resp" | jq -e '.ok' &>/dev/null; then
+    echo "Restarted: $target"
+    echo "$resp" | jq -r '.results[]?' 2>/dev/null
+  else
+    echo "Failed:" >&2
+    echo "$resp" | jq . >&2
+    exit 1
+  fi
+}
+
+# --- Dispatch ---
+case "$CMD" in
+  ls|list)    cmd_list ;;
+  watch)      cmd_watch ;;
+  kill)       cmd_kill ;;
+  restart)    cmd_restart ;;
+  *)          echo "Unknown command: $CMD" >&2; usage ;;
+esac
