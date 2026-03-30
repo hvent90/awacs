@@ -37,7 +37,7 @@ AWACS scans your system for listening TCP ports and maps each one to its process
 ## Usage
 
 ```
-bun run server.ts
+bun run start
 ```
 
 Open `http://localhost:7777`. From other machines: `http://<your-ip>:7777`.
