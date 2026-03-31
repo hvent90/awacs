@@ -31,6 +31,7 @@ function buildTree(services: Service[], indexMap: number[]): Record<string, Tree
     path = path.replace(/^\/private/, "");
 
     const parts = path.split("/").filter(Boolean);
+    if (parts.length === 0) parts.push("/");
     let node = tree;
     for (let j = 0; j < parts.length; j++) {
       const part = parts[j];
